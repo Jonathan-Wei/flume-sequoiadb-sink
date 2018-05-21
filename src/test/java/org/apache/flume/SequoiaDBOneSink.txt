@@ -1,0 +1,636 @@
+package org.apache.flume;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.flume.Channel;
+import org.apache.flume.Context;
+import org.apache.flume.Event;
+import org.apache.flume.EventDeliveryException;
+import org.apache.flume.Transaction;
+import org.apache.flume.conf.Configurable;
+import org.apache.flume.instrumentation.SinkCounter;
+import org.apache.flume.sink.AbstractSink;
+import org.bson.BSONObject;
+import org.bson.BasicBSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.sequoiadb.base.CollectionSpace;
+import com.sequoiadb.base.ConfigOptions;
+import com.sequoiadb.base.DBCollection;
+import com.sequoiadb.base.Sequoiadb;
+import com.sequoiadb.datasource.ConnectStrategy;
+import com.sequoiadb.datasource.DatasourceOptions;
+import com.sequoiadb.datasource.SequoiadbDatasource;
+import com.sequoiadb.exception.BaseException;
+
+public class SequoiaDBOneSink extends AbstractSink implements  Configurable
+{
+    private static final Logger LOG = LoggerFactory.getLogger(SequoiaDBOneSink.class);
+    private static Semaphore semaphore = new Semaphore(1);  
+
+    private String DEFAULTUSERNAME = "";
+    private String DEFAULTPASSWORD = "";
+    private int DEFAULTCONNECTTIMEOUT = 500;
+    private int DEFAULTMAXAUTOCONNECTRETRYTIME = 0;
+    private int DEFAULTMAXCOUNT = 500;
+    private int DEFAULTDELTAINCCOUNT = 20;
+    private int DEFAULTMAXIDLECOUNT = 20 ;
+    private int DEFAULTKEEPALIVETIMEOUT =0 ;
+    private int DEFAULTCHECKINTERVAL = 60 * 1000;
+    private int DEFAULTSYNCCOORDINTERVAL=0;
+    private boolean DEFAULTVALIDATECONNECTION = false;
+    private String DEFAULTCONNECTSTRATEGY = "BALANCE";
+    private int DEFAULTBATCHSIZE = 10;
+    private String DEFAULTFIELDDELIMITER=" ";
+    private String DELIMITER = ",";
+    private int DEFAULTOPERATIONINDEX= 0;
+    private int DEFAULTUNIQUEIDENTIFIERINDEX = 1;
+    private String DEFAULTOPERATIONTYPE="all";
+    private int DEFAULTINSERTBATCHSIZE = 10;
+    private String DEFAULTOPERATIONDELEMITER = "\\|";
+    
+    private String sequoiadbServers;
+    private String username;
+    private String password;
+    private int connectTimeOut;
+    private int maxAutoConnectRetryTime;
+    private int maxCount;
+    private int deltaIncCount;
+    private int maxIdleCount;
+    private int keepAliveTimeout;
+    private int checkInterval;
+    private int syncCoordInterval;
+    private boolean validateConnection;
+    private String connectStrategy;
+    
+    private Integer batchSize;
+    private Integer insertBatchSize;
+    private static String collectionSpace;
+    private static String collection;
+    private String[] collectionFields;
+    private String fieldDelimiter;
+    private String[] fieldTypes;
+    private HashSet<String> operationTypes;
+    private String defaultOperationType;
+    private String operationDelemiter;
+    
+    private int operationIndex;
+    private int uniqueIdentifierIndex;
+    
+    private static SequoiadbDatasource ds = null;
+    
+    private List<String> addrs = null;
+    private ConfigOptions nwOpt = new ConfigOptions();
+    private DatasourceOptions dsOpt = new DatasourceOptions();
+    
+    private SinkCounter sinkCounter;
+    
+    @Override
+    public void configure(Context context) {
+    	sequoiadbServers = context.getString(Config.SEQUOIADB_SERVERS);
+        if (sequoiadbServers == null) {
+          throw new IllegalArgumentException(Config.SEQUOIADB_SERVERS + " config setting is not " +
+                  "specified for sink " + getName());
+        }
+        
+        if (sequoiadbServers.equalsIgnoreCase("null")) { // for testing support
+        	sequoiadbServers = null;
+        }
+        
+        if (sequoiadbServers != null) {
+        	addrs = new ArrayList<String>();
+        	addrs = Arrays.asList(sequoiadbServers.split(","));
+        }
+        
+        batchSize = context.getInteger(Config.SEQUOIADB_BATCHSIZSE,DEFAULTBATCHSIZE);
+        if (batchSize < 0) {
+            LOG.warn(getName() + ". sequoiadb.batchSize must be  positive number. Defaulting to "
+                    + DEFAULTBATCHSIZE);
+            batchSize = DEFAULTBATCHSIZE;
+        }
+        
+        username = context.getString(Config.SEQUOIADB_USERNAME,DEFAULTUSERNAME);
+        password = context.getString(Config.SEQUOIADB_PASSWORD,DEFAULTPASSWORD);
+        
+        collectionSpace = context.getString(Config.SEQUOIADB_COLLECTION_SPACE);
+        if (connectTimeOut < 0) {
+            LOG.warn(getName() + ". sequoiadb.collectionSpace must be  not null.");
+        }
+        collection = context.getString(Config.SEQUOIADB_COLLECTION);
+        if (connectTimeOut < 0) {
+            LOG.warn(getName() + ". sequoiadb.collection must be not null.");
+        }
+        
+        connectTimeOut = context.getInteger(Config.SEQUOIADB_POOL_CONNECTTIMEOUT,DEFAULTCONNECTTIMEOUT);
+        if (connectTimeOut < 0) {
+            LOG.warn(getName() + ". sequoiadb.pool.connectTimeOut must be  positive number. Defaulting to "
+                    + DEFAULTCONNECTTIMEOUT);
+            connectTimeOut = DEFAULTCONNECTTIMEOUT;
+        }
+        nwOpt.setConnectTimeout(connectTimeOut);
+        
+        maxAutoConnectRetryTime = context.getInteger(Config.SEQUOIADB_POOL_MAXAUTOCONNECTRETRYTIME,DEFAULTMAXAUTOCONNECTRETRYTIME);
+        if (maxAutoConnectRetryTime < 0) {
+            LOG.warn(getName() + ". sequoiadb.pool.maxAutoConnectRetryTime must be  positive number. Defaulting to "
+                    + DEFAULTMAXAUTOCONNECTRETRYTIME);
+            maxAutoConnectRetryTime = DEFAULTMAXAUTOCONNECTRETRYTIME;
+        }
+        nwOpt.setMaxAutoConnectRetryTime(maxAutoConnectRetryTime);
+        
+        // 设置连接池参数
+        maxCount = context.getInteger(Config.SEQUOIADB_POOL_MAXCOUNT,DEFAULTMAXCOUNT);
+        if (maxCount < 0) {
+            LOG.warn(getName() + ". sequoiadb.pool.maxCount must be  positive number. Defaulting to "
+                    + DEFAULTMAXCOUNT);
+            maxCount = DEFAULTMAXCOUNT;
+        }
+        dsOpt.setMaxCount(maxCount);                            // 连接池最多能提供500个连接。
+        deltaIncCount = context.getInteger(Config.SEQUOIADB_POOL_DELTAINCCOUNT,DEFAULTDELTAINCCOUNT);
+        if (deltaIncCount < 0) {
+            LOG.warn(getName() + ". sequoiadb.pool.deltaIncCount must be  positive number. Defaulting to "
+                    + DEFAULTDELTAINCCOUNT);
+            deltaIncCount = DEFAULTDELTAINCCOUNT;
+        }
+        dsOpt.setDeltaIncCount(deltaIncCount);                        // 每次增加20个连接。
+        maxIdleCount = context.getInteger(Config.SEQUOIADB_POOL_MAXIDLECOUNT,DEFAULTMAXIDLECOUNT);
+        if (maxIdleCount < 0) {
+            LOG.warn(getName() + ". sequoiadb.pool.maxIdleCount must be  positive number. Defaulting to "
+                    + DEFAULTMAXIDLECOUNT);
+            maxIdleCount = DEFAULTMAXIDLECOUNT;
+        }
+        dsOpt.setMaxIdleCount(maxIdleCount);                         // 连接池空闲时，保留20个连接。
+        keepAliveTimeout = context.getInteger(Config.SEQUOIADB_POOL_KEEPALIVETIMEOUT,DEFAULTKEEPALIVETIMEOUT);
+        if (keepAliveTimeout < 0) {
+            LOG.warn(getName() + ". sequoiadb.pool.keepAliveTimeout must be  positive number. Defaulting to "
+                    + DEFAULTKEEPALIVETIMEOUT);
+            keepAliveTimeout = DEFAULTKEEPALIVETIMEOUT;
+        }
+        dsOpt.setKeepAliveTimeout(keepAliveTimeout);                      // 池中空闲连接存活时间。单位:毫秒。
+                                                           // 0表示不关心连接隔多长时间没有收发消息。
+        checkInterval = context.getInteger(Config.SEQUOIADB_POOL_CHECKINTERVAL,DEFAULTCHECKINTERVAL);
+        if (checkInterval < 0) {
+            LOG.warn(getName() + ". sequoiadb.pool.checkInterval must be  positive number. Defaulting to "
+                    + DEFAULTCHECKINTERVAL);
+            checkInterval = DEFAULTCHECKINTERVAL;
+        }
+        dsOpt.setCheckInterval(checkInterval);                 // 每隔60秒将连接池中多于
+                                                           // MaxIdleCount限定的空闲连接关闭，
+                                                           // 并将存活时间过长（连接已停止收发
+                                                           // 超过keepAliveTimeout时间）的连接关闭。
+        syncCoordInterval = context.getInteger(Config.SEQUOIADB_POOL_SYNCCOORDINTERVAL,DEFAULTSYNCCOORDINTERVAL);
+        if (syncCoordInterval < 0) {
+            LOG.warn(getName() + ". sequoiadb.pool.syncCoordInterval must be  positive number. Defaulting to "
+                    + DEFAULTSYNCCOORDINTERVAL);
+            syncCoordInterval = DEFAULTSYNCCOORDINTERVAL;
+        }
+        dsOpt.setSyncCoordInterval(syncCoordInterval);                     // 向catalog同步coord地址的周期。单位:毫秒。
+                                                           // 0表示不同步。
+        validateConnection = context.getBoolean(Config.SEQUOIADB_POOL_VALIDATECONNECTION,DEFAULTVALIDATECONNECTION);
+        dsOpt.setValidateConnection(validateConnection);                // 连接出池时，是否检测连接的可用性，默认不检测。
+        
+        connectStrategy = context.getString(Config.SEQUOIADB_POOL_CONNECTSTRATEGY,DEFAULTCONNECTSTRATEGY);
+        if (connectStrategy.equals(ConnectStrategy.BALANCE.toString())){
+        	dsOpt.setConnectStrategy(ConnectStrategy.BALANCE); // 默认使用coord地址负载均衡的策略获取连接。
+        }else if (connectStrategy.equals(ConnectStrategy.LOCAL.toString())){
+        	dsOpt.setConnectStrategy(ConnectStrategy.LOCAL); 
+        }else if (connectStrategy.equals(ConnectStrategy.RANDOM.toString())){
+        	dsOpt.setConnectStrategy(ConnectStrategy.RANDOM); 
+        }else if (connectStrategy.equals(ConnectStrategy.SERIAL.toString())){
+        	dsOpt.setConnectStrategy(ConnectStrategy.SERIAL); 
+        }
+        
+        collectionSpace = context.getString(Config.SEQUOIADB_COLLECTION_SPACE);
+        
+        LOG.info("space is :"+collectionSpace);
+        collection = context.getString(Config.SEQUOIADB_COLLECTION);
+        
+        LOG.info("space is :"+collection);
+        
+        fieldDelimiter = context.getString(Config.SEQUOIADB_COLLECTION_FIELDDELIMITER,DEFAULTFIELDDELIMITER);
+        
+        String collectionFieldsStr = context.getString(Config.SEQUOIADB_COLLECTION_FIELDS);
+        if (collectionFieldsStr != null ){
+        	collectionFields = collectionFieldsStr.split(DELIMITER);
+        	LOG.error(getName() +". sequoiadb.pool.fields must be not null. ");
+        }
+        
+        String operationTypesStr = context.getString(Config.SEQUOIADB_OPERATION_TYPES,DEFAULTOPERATIONTYPE);
+        if (!operationTypesStr.equals(DEFAULTOPERATIONTYPE)){
+        	operationTypes = new HashSet<String>();
+        	String []types = operationTypesStr.split(DELIMITER);
+        	for (int i = 0; i < types.length; i++) {
+        		if(types[i].equals("insert")){
+        			operationTypes.add("I");
+        		}else if (types[i].equals("update")){
+        			operationTypes.add("U");
+        		}else if (types[i].equals("delete")){
+        			operationTypes.add("D");
+        		}
+			}
+        }else{
+        	defaultOperationType = DEFAULTOPERATIONTYPE;
+        }
+        
+        if(operationTypesStr.equals("insert")){
+        	insertBatchSize = context.getInteger(Config.SEQUOIADB_INSERT_BATCHSIZE,DEFAULTINSERTBATCHSIZE);
+        	if (insertBatchSize<0){
+        		LOG.warn(getName() + ". sequoiadb.pool.checkInterval must be  positive number. Defaulting to "
+                        + DEFAULTINSERTBATCHSIZE);
+        		insertBatchSize = DEFAULTINSERTBATCHSIZE;
+        	}
+        }
+        
+        operationDelemiter = context.getString(Config.SEQUOIADB_OPERATION_DELEMITER,DEFAULTOPERATIONDELEMITER);
+        
+        String fieldTypesStr = context.getString(Config.SEQUOIADB_COLLECTION_FIELDTYPES);
+        if (fieldTypesStr != null ){
+        	fieldTypes = fieldTypesStr.split(DELIMITER);
+        }else{
+        	LOG.error(getName() +". sequoiadb.pool.field.types must be not null. ");
+        }
+        
+        if(collectionFields.length != fieldTypes.length){
+        	LOG.error(getName() + ". sequoiadb.pool.fields and "+getName() +". sequoiadb.pool.field.types number of fields does not match. ");
+        }
+        
+        // 操作字段索引
+        operationIndex = context.getInteger(Config.SEQUOIADB_OPERATION_INDEX,DEFAULTOPERATIONINDEX);
+        if (operationIndex < 0) {
+            LOG.warn(getName() + ". sequoiadb.operation.index must be  positive number. Defaulting to "
+                    + DEFAULTOPERATIONINDEX);
+            operationIndex = DEFAULTOPERATIONINDEX;
+        }
+        
+        // 设置唯一标识索引
+        uniqueIdentifierIndex = context.getInteger(Config.SEQUOIADB_UNIQUE_IDENTIFIER_INDEX,DEFAULTUNIQUEIDENTIFIERINDEX);
+        if (uniqueIdentifierIndex < 0) {
+            LOG.warn(getName() + ". sequoiadb.unique.identifier.index must be  positive number. Defaulting to "
+                    + DEFAULTUNIQUEIDENTIFIERINDEX);
+            uniqueIdentifierIndex = DEFAULTUNIQUEIDENTIFIERINDEX;
+        }
+        
+        ds = new SequoiadbDatasource(addrs, username, password, nwOpt, dsOpt);
+        
+        if (sinkCounter == null) {
+            sinkCounter = new SinkCounter(getName());
+        }
+    }
+    
+    @VisibleForTesting
+    protected SinkCounter getCounter() {
+      return sinkCounter;
+    }
+
+	@Override
+	public Status process() throws EventDeliveryException {
+		// TODO Auto-generated method stub
+		Channel channel = getChannel();
+	    Transaction transaction = channel.getTransaction();
+	    transaction.begin();
+	    boolean success = false;
+        
+        try {
+            
+//        	int txnEventCount = drainOneBatch(channel);
+        	int txnEventCount = drainOne(channel);
+        	LOG.info("process method - drainOne return txtEventCount is :"+txnEventCount);
+			
+			transaction.commit();
+	        success = true;
+	        
+	        if (txnEventCount < 1) {
+	          return Status.BACKOFF;
+	        } else {
+	          return Status.READY;
+	        }
+	        
+		} catch (BaseException e) {
+			// TODO Auto-generated catch block
+			LOG.error(e.getMessage(),e);
+			return Status.BACKOFF;
+		} catch (InterruptedException e) {
+			// TODO Auto-generated catch block
+			LOG.error(e.getMessage(),e);
+			return Status.BACKOFF;
+		} catch (Exception e){
+			throw new EventDeliveryException(e);
+		}finally{
+			if (!success) {
+		        transaction.rollback();
+		      }
+		      transaction.close();
+		}
+	}
+	
+	private int drainOne(Channel channel)throws BaseException, InterruptedException{
+		int txnEventCount = 0;
+		Sequoiadb db = null;
+        DBCollection cl = null;
+        
+        db = ds.getConnection();
+        
+        cl = initCollection();
+        
+        int insertSize = 0;
+        //由于数据本身存在增删改操作
+        try {
+	    	// 按batchSize大小插入数据
+	    	for (; txnEventCount < batchSize; ++txnEventCount) {
+	    		LOG.info("txnEventCount is :"+txnEventCount);
+	    		Event event = channel.take();
+	    		
+	            if (event == null) {
+	            	LOG.info("event is null!");
+	            	break;
+	            }
+	            //获取数据
+	            String content = new String(event.getBody());
+	            LOG.info("event body is :"+content);
+	            
+	            String []infos = content.split(operationDelemiter);
+	            
+	            String operation = infos[0];
+	            
+	            if(infos[1].length() == 0){
+        			continue;
+        		}
+	            //判断操作类型是all，还是单个
+	            if (defaultOperationType != null && defaultOperationType.equals(DEFAULTOPERATIONTYPE)){
+	            	if (operation.equals("I")){
+	            		insert(cl,infos[1]); 
+		            }else if (operation.equals("U")){
+		            	update(cl,infos[1],infos[2]);
+		            }else if (operation.equals("D")){
+		            	delete(cl,infos[1]);
+		            }
+	            }else if(operationTypes.contains("I") && operationTypes.size() == 1){ //insert 批量插入
+	            	List<BSONObject> items = new ArrayList<BSONObject>();
+	            	
+	            	BSONObject item = new BasicBSONObject();
+	        		String[]values = content.split(fieldDelimiter);
+	                
+	        		//封装bson对象
+	                for (int i = 0; i < values.length; i++) {
+	        			String field = collectionFields[i];
+	        			String type = fieldTypes[i];
+	        			LOG.info("field = "+field +",type =" +type+",value="+typeConvert(type,values[i]));
+	        			//默认操作字段占用第一个字段
+	        			item.put(field, typeConvert(type,values[i+1]));
+	        		}
+	                items.add(item);
+	                insertSize = insertSize + 1;
+	                
+	                if (txnEventCount == batchSize || insertSize == insertBatchSize){
+	                	cl.insert(items);
+	                	
+	                	items.clear();
+	                }
+	            }else{
+	            	if (operation.equals("I") && operationTypes.contains(operation)){
+	            		Object _id = insert(cl,infos[1]); 
+		            }else if (operation.equals("U") && operationTypes.contains(operation)){
+		            	update(cl,infos[1],infos[2]);
+		            }else if (operation.equals("D") && operationTypes.contains(operation)){
+		            	delete(cl,infos[1]);
+		            }
+	            }
+	    	}
+			LOG.info("End for floor,the txnEventCount is :"+txnEventCount);
+			if (txnEventCount == 0) {
+				sinkCounter.incrementBatchEmptyCount();
+			} else if (txnEventCount == batchSize) {
+				sinkCounter.incrementBatchCompleteCount();
+			} else {
+				sinkCounter.incrementBatchUnderflowCount();
+			}
+			sinkCounter.addToEventDrainAttemptCount(txnEventCount);
+			 
+			sinkCounter.addToEventDrainSuccessCount(txnEventCount);
+			ds.releaseConnection(db);
+			sinkCounter.incrementConnectionClosedCount();
+	        
+	        return txnEventCount;
+        }catch(BaseException e){
+	    	sinkCounter.incrementConnectionFailedCount();
+	    	LOG.error(e.getMessage(),e);
+	    	throw e;
+	    }catch (Exception e) {
+			LOG.error(e.getMessage(),e);
+			throw e;
+		}
+	}
+	
+	private Object insert(DBCollection cl,String content){
+		BSONObject item = new BasicBSONObject();
+		String[]values = content.split(fieldDelimiter);
+        
+		//封装bson对象
+        for (int i = 0; i < values.length; i++) {
+			String field = collectionFields[i];
+			String type = fieldTypes[i];
+			//默认操作字段占用第一个字段
+			item.put(field, typeConvert(type,values[i]));
+		}
+        item.put("in_timestamp", System.currentTimeMillis());
+        return cl.insert(item);
+	}
+	
+	private void update(DBCollection cl,String matcherInfo,String modifierInfo){
+		BSONObject matcher = new BasicBSONObject();
+    	BSONObject modifier = new BasicBSONObject();
+    	String []matchers = matcherInfo.split(",");
+    	for (int i = 0; i < matchers.length; i++) {
+    		String []item = matchers[i].split(":");
+    		matcher.put(item[0], item[1]);
+		}
+    	
+    	BSONObject modifiesObj = new BasicBSONObject();
+    	String []modifies = modifierInfo.split(",");
+    	for (int i = 0; i < modifies.length; i++) {
+    		String []item = modifies[i].split(":");
+    		modifiesObj.put(item[0], item[1]);
+		}
+    	
+    	modifier.put("$set", modifiesObj);
+    	
+    	cl.update(matcher, modifier, null);
+	}
+	
+	private void delete(DBCollection cl,String matcherInfo){
+		BSONObject matcher = new BasicBSONObject();
+    	String []matchers = matcherInfo.split(",");
+    	for (int i = 0; i < matchers.length; i++) {
+    		String []item = matchers[i].split(":");
+    		matcher.put(item[0], item[1]);
+		}
+    	cl.delete(matcher);
+	}
+	
+	private int drainOneBatch(Channel channel) throws BaseException, InterruptedException{
+		int txnEventCount = 0;
+		Sequoiadb db = null;
+        DBCollection cl = null;
+        
+        db = ds.getConnection();
+        
+        cl = initCollection();
+        
+        //采用insert批量数据插入
+        List<BSONObject> items = new ArrayList<BSONObject>();
+	    try {
+	    	BSONObject item = null;
+	    	// 按batchSize大小插入数据
+	    	for (; txnEventCount < batchSize; ++txnEventCount) {
+	    		item = new BasicBSONObject();
+	    		
+	    		Event event = channel.take();
+	            if (event == null) {
+	              break;
+	            }
+	           
+	            //获取数据
+	            String content = new String(event.getBody());
+	            String[]values = content.split(fieldDelimiter);
+	            
+	            if(null == values || values.length == 0) {
+	            	continue;
+	            }
+	            
+	            //封装bson对象
+	            for (int i = 0; i < values.length; i++) {
+					String field = collectionFields[i];
+					String type = fieldTypes[i];
+					LOG.info("field = "+field +",type =" +type+",value="+typeConvert(type,values[i]));
+					//默认操作字段占用第一个字段
+					item.put(field, typeConvert(type,values[i+1]));
+				}
+	            
+	            //添加入库时间字段
+	            item.put("in_timestamp", System.currentTimeMillis());
+	            LOG.info("item information is :"+item.toString());
+	            
+	            items.add(item);
+	    	}
+	    	
+			if (txnEventCount == 0) {
+				sinkCounter.incrementBatchEmptyCount();
+			} else if (txnEventCount == batchSize) {
+				sinkCounter.incrementBatchCompleteCount();
+			} else {
+				sinkCounter.incrementBatchUnderflowCount();
+			}
+			sinkCounter.addToEventDrainAttemptCount(txnEventCount);
+    		//判断message的类型进行数据库操作
+			LOG.info("items size = "+items.size());
+			if (items.size()>0){
+				
+				cl.insert(items);
+				sinkCounter.addToEventDrainSuccessCount(txnEventCount);
+				ds.releaseConnection(db);
+				sinkCounter.incrementConnectionClosedCount();
+				
+				items.clear();
+			}
+	    }catch(BaseException e){
+	    	sinkCounter.incrementConnectionFailedCount();
+	    	LOG.error(e.getMessage(),e);
+	    }catch (Exception e) {
+			LOG.error(e.getMessage(),e);
+		}
+        
+        return txnEventCount;
+	}
+	
+	@Override
+	public synchronized void start() {
+		// TODO Auto-generated method stub
+		sinkCounter.start();
+		super.start();
+	}
+
+	@Override
+	public synchronized void stop() {
+		// TODO Auto-generated method stub
+		sinkCounter.stop();
+		super.stop();
+	}
+
+	private Object typeConvert(String type,String value){
+		if (type.equals("float")){
+			return Float.valueOf(value);
+		}else if (type.equals("int")){
+			return Integer.valueOf(value);
+		}else if (type.equals("boolean")){
+			return Boolean.valueOf(value);
+		}else if (type.equals("double")){
+			return Double.valueOf(value);
+		}else if (type.equals("long")){
+			return Long.valueOf(value);
+		}else{
+			return value;
+		}
+	}
+	
+	public static synchronized Sequoiadb getSequoiadb() {  
+        Sequoiadb sdb = null;  
+        try {  
+            sdb = ds.getConnection();  
+        } catch (BaseException ex) { 
+            LOG.error(ex.getMessage(),ex) ;
+        } catch (InterruptedException ex) {  
+        	LOG.error(ex.getMessage(),ex) ; 
+        }  
+  
+        if (sdb == null) {  
+            while (sdb == null) {  
+                try {  
+                    semaphore.tryAcquire(1, 2, TimeUnit.SECONDS);  
+                } catch (InterruptedException ex) {  
+                	LOG.error(ex.getMessage(),ex) ; 
+                }  
+                try {  
+                    sdb = ds.getConnection();  
+                } catch (BaseException | InterruptedException ex) {  
+                	LOG.error(ex.getMessage(),ex) ; 
+                }  
+            }  
+            semaphore.release();  
+            return sdb;  
+        }  
+        return sdb;  
+    }  
+	
+	public static CollectionSpace initCollectionSpace(String csName) {  
+        try {  
+            Sequoiadb sdb = getSequoiadb();
+            CollectionSpace cs;  
+            if (sdb.isCollectionSpaceExist(csName)) {  
+                cs = sdb.getCollectionSpace(csName);  
+            } else {  
+                cs = sdb.createCollectionSpace(csName);  
+            }  
+            return cs;  
+        } catch (BaseException ex) { 
+            LOG.debug("initCollectionSpace method get Sequoiadb is null!");  
+            return null;  
+        }  
+    } 
+	
+	public static DBCollection initCollection(){
+		CollectionSpace cs = initCollectionSpace(collectionSpace);  
+        DBCollection cl;  
+        if (cs.isCollectionExist(collection)) {  
+            cl = cs.getCollection(collection);  
+        } else {  
+            cl = cs.createCollection(collection);  
+        }  
+        return cl; 
+	}
+}
